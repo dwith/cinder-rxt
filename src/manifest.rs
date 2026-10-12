@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
-const DIFF_MAGIC: &[u8; 4] = b"RXTD";
-const DIFF_VERSION: u16 = 1;
+const MANIFEST_MAGIC: &[u8; 4] = b"RXTM";
+const MANIFEST_VERSION: u16 = 2;
 
 /// Metadata stored in `manifest/meta.json` inside the Swift container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,40 +35,49 @@ pub struct VolumeManifestMeta {
 pub struct SnapshotEntry {
     pub snapshot_id: String,
     pub created_at: i64,
-    pub diff_file: String,
-    pub changed_chunks: u32,
+    #[serde(alias = "diff_file")]
+    pub manifest_file: String,
+    #[serde(default)]
+    pub total_chunks: u32,
+    #[serde(alias = "changed_chunks", default)]
+    pub active_chunks: u32,
 }
 
-/// A compact binary delta representing changed chunks for a single snapshot.
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotDiff {
-    #[allow(dead_code)]
+/// A self-contained, autonomous block map for a single point-in-time snapshot.
+/// Maps every non-zero block index to its content-addressed SHA-256 hash in Swift.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotManifest {
     pub snapshot_id: String,
-    pub changes: Vec<(u32, [u8; 32])>, // (block_index, sha256_hash)
+    pub volume_id: String,
+    pub total_chunks: u32,
+    pub block_map: HashMap<u32, [u8; 32]>, // block_index -> sha256_hash
 }
 
-impl SnapshotDiff {
-    pub fn new(snapshot_id: String) -> Self {
+impl SnapshotManifest {
+    pub fn new(snapshot_id: String, volume_id: String, total_chunks: u32) -> Self {
         Self {
             snapshot_id,
-            changes: Vec::new(),
+            volume_id,
+            total_chunks,
+            block_map: HashMap::new(),
         }
     }
 
-    pub fn add_change(&mut self, block_index: u32, hash: [u8; 32]) {
-        self.changes.push((block_index, hash));
-    }
-
     /// Serialize to compact binary:
-    /// [4 bytes Magic][2 bytes Version][4 bytes Count]
+    /// [4 bytes Magic "RXTM"][2 bytes Version][4 bytes TotalChunks][4 bytes ActiveChunksCount]
     /// Followed by N records of: [4 bytes BlockIdx][32 bytes Hash]
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(10 + self.changes.len() * 36);
-        buf.write_all(DIFF_MAGIC)?;
-        buf.write_u16::<BigEndian>(DIFF_VERSION)?;
-        buf.write_u32::<BigEndian>(self.changes.len() as u32)?;
+        let mut buf = Vec::with_capacity(14 + self.block_map.len() * 36);
+        buf.write_all(MANIFEST_MAGIC)?;
+        buf.write_u16::<BigEndian>(MANIFEST_VERSION)?;
+        buf.write_u32::<BigEndian>(self.total_chunks)?;
+        buf.write_u32::<BigEndian>(self.block_map.len() as u32)?;
 
-        for (idx, hash) in &self.changes {
+        // Sort by block index for deterministic serialization
+        let mut entries: Vec<(&u32, &[u8; 32])> = self.block_map.iter().collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+
+        for (idx, hash) in entries {
             buf.write_u32::<BigEndian>(*idx)?;
             buf.write_all(hash)?;
         }
@@ -76,48 +85,37 @@ impl SnapshotDiff {
     }
 
     /// Parse from compact binary.
-    pub fn deserialize(snapshot_id: String, bytes: &[u8]) -> Result<Self> {
+    pub fn deserialize(snapshot_id: String, volume_id: String, bytes: &[u8]) -> Result<Self> {
         let mut rdr = Cursor::new(bytes);
         let mut magic = [0u8; 4];
         rdr.read_exact(&mut magic)?;
-        if &magic != DIFF_MAGIC {
-            bail!("Invalid diff magic header: {:?}", magic);
+        if &magic != MANIFEST_MAGIC {
+            bail!("Invalid manifest magic header: {:?}", magic);
         }
 
         let version = rdr.read_u16::<BigEndian>()?;
-        if version != DIFF_VERSION {
-            bail!("Unsupported diff version: {}", version);
+        if version != MANIFEST_VERSION {
+            bail!("Unsupported manifest version: {}", version);
         }
 
+        let total_chunks = rdr.read_u32::<BigEndian>()?;
         let count = rdr.read_u32::<BigEndian>()? as usize;
-        let mut changes = Vec::with_capacity(count);
+        let mut block_map = HashMap::with_capacity(count);
 
         for _ in 0..count {
             let idx = rdr.read_u32::<BigEndian>()?;
             let mut hash = [0u8; 32];
             rdr.read_exact(&mut hash)?;
-            changes.push((idx, hash));
+            block_map.insert(idx, hash);
         }
 
         Ok(Self {
             snapshot_id,
-            changes,
+            volume_id,
+            total_chunks,
+            block_map,
         })
     }
-}
-
-/// Resolves a full block map by replaying a sequence of diffs up to the target snapshot.
-pub fn replay_block_map(
-    total_blocks: u32,
-    diffs_in_order: &[SnapshotDiff],
-) -> HashMap<u32, [u8; 32]> {
-    let mut map = HashMap::with_capacity(total_blocks as usize);
-    for diff in diffs_in_order {
-        for (idx, hash) in &diff.changes {
-            map.insert(*idx, *hash);
-        }
-    }
-    map
 }
 
 #[cfg(test)]
@@ -125,37 +123,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_diff_serialization_roundtrip() {
-        let mut diff = SnapshotDiff::new("snap-test-1".to_string());
-        diff.add_change(0, [1u8; 32]);
-        diff.add_change(10, [2u8; 32]);
-        diff.add_change(250000, [3u8; 32]);
+    fn test_manifest_serialization_roundtrip() {
+        let mut manifest = SnapshotManifest::new(
+            "snap-test-1".to_string(),
+            "vol-test-1".to_string(),
+            5120,
+        );
+        manifest.block_map.insert(0, [1u8; 32]);
+        manifest.block_map.insert(10, [2u8; 32]);
+        manifest.block_map.insert(250000, [3u8; 32]);
 
-        let bytes = diff.serialize().expect("serialize failed");
-        // Header (10 bytes) + 3 * 36 bytes = 118 bytes
-        assert_eq!(118, bytes.len());
+        let bytes = manifest.serialize().expect("serialize failed");
+        // Header (14 bytes) + 3 * 36 bytes = 122 bytes
+        assert_eq!(122, bytes.len());
 
-        let decoded = SnapshotDiff::deserialize("snap-test-1".to_string(), &bytes)
-            .expect("deserialize failed");
-        assert_eq!(3, decoded.changes.len());
-        assert_eq!((0, [1u8; 32]), decoded.changes[0]);
-        assert_eq!((10, [2u8; 32]), decoded.changes[1]);
-        assert_eq!((250000, [3u8; 32]), decoded.changes[2]);
+        let decoded = SnapshotManifest::deserialize(
+            "snap-test-1".to_string(),
+            "vol-test-1".to_string(),
+            &bytes,
+        )
+        .expect("deserialize failed");
+
+        assert_eq!(5120, decoded.total_chunks);
+        assert_eq!(3, decoded.block_map.len());
+        assert_eq!(Some(&[1u8; 32]), decoded.block_map.get(&0));
+        assert_eq!(Some(&[2u8; 32]), decoded.block_map.get(&10));
+        assert_eq!(Some(&[3u8; 32]), decoded.block_map.get(&250000));
     }
 
     #[test]
-    fn test_replay_block_map() {
-        let mut diff1 = SnapshotDiff::new("snap-1".to_string());
-        diff1.add_change(0, [1u8; 32]);
-        diff1.add_change(1, [1u8; 32]);
+    fn test_autonomous_manifests_independent_deletion() {
+        // Snapshot 1 manifest
+        let mut snap1 = SnapshotManifest::new("snap-1".to_string(), "vol-1".to_string(), 4);
+        snap1.block_map.insert(0, [1u8; 32]);
+        snap1.block_map.insert(1, [1u8; 32]);
 
-        let mut diff2 = SnapshotDiff::new("snap-2".to_string());
-        diff2.add_change(1, [2u8; 32]); // block 1 modified
-        diff2.add_change(2, [3u8; 32]); // block 2 added
+        // Snapshot 2 built on top of snap 1
+        let mut snap2 = SnapshotManifest::new("snap-2".to_string(), "vol-1".to_string(), 4);
+        // snap 2 retains block 0, updates block 1, adds block 2
+        snap2.block_map.insert(0, [1u8; 32]);
+        snap2.block_map.insert(1, [2u8; 32]); // updated
+        snap2.block_map.insert(2, [3u8; 32]); // added
 
-        let map = replay_block_map(3, &[diff1, diff2]);
-        assert_eq!(Some(&[1u8; 32]), map.get(&0));
-        assert_eq!(Some(&[2u8; 32]), map.get(&1));
-        assert_eq!(Some(&[3u8; 32]), map.get(&2));
+        // Deleting snap 1 has ZERO effect on snap 2's integrity
+        drop(snap1);
+
+        assert_eq!(Some(&[1u8; 32]), snap2.block_map.get(&0));
+        assert_eq!(Some(&[2u8; 32]), snap2.block_map.get(&1));
+        assert_eq!(Some(&[3u8; 32]), snap2.block_map.get(&2));
+        assert_eq!(None, snap2.block_map.get(&3));
     }
 }

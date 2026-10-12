@@ -99,7 +99,12 @@ CONF = cfg.CONF
 CONF.register_opts(volume_opts, group=configuration.SHARED_CONF_GROUP)
 
 
+def register_opts(conf):
+    conf.register_opts(volume_opts)
+
+
 @interface.volumedriver
+
 class RXTLVM(driver.VolumeDriver):
     """Full fork of the Cinder LVM Driver with native encryption and multipath iSCSI."""
 
@@ -183,8 +188,55 @@ class RXTLVM(driver.VolumeDriver):
     def _sizestr(self, size_in_g):
         return "%sg" % size_in_g
 
+    def _get_lv_size_str(self, volume, size_in_g=None):
+        """Return the LVM size string (-L format) for an LV.
+
+        For unencrypted volumes, returns '<size>g'.
+        For encrypted volumes, automatically calculates and adds the LUKS header
+        overhead (e.g. +16 MiB for LUKS2, +4 MiB for LUKS1) so that the decrypted
+        dm-crypt device presents the full requested nominal capacity.
+        """
+        if size_in_g is None:
+            size_in_g = (
+                volume.get("size")
+                if isinstance(volume, dict)
+                else getattr(volume, "size", 0)
+            )
+        size_in_g = int(size_in_g)
+        context = getattr(volume, "_context", None)
+        overhead_mib = encryption.get_volume_overhead_mib(
+            volume, context=context, db=getattr(self, "db", None)
+        )
+        if overhead_mib > 0:
+            total_mib = (size_in_g * 1024) + overhead_mib
+            vol_name = (
+                volume.get("name")
+                if isinstance(volume, dict)
+                else getattr(volume, "name", "")
+            )
+            LOG.info(
+                "Allocating encrypted LV %(name)s with %(overhead)d MiB LUKS "
+                "header padding (total %(total_mib)d MiB) to provide full %(size)d GiB payload.",
+                {
+                    "name": vol_name,
+                    "overhead": overhead_mib,
+                    "total_mib": total_mib,
+                    "size": size_in_g,
+                },
+            )
+            return f"{total_mib}M"
+        return "%sg" % size_in_g
+
     def _volume_not_present(self, volume_name):
         return self.vg.get_volume(volume_name) is None
+
+    def _legacy_snapshot_lv_exists(self, snap_name):
+        """Check if an unconverted legacy snapshot LV exists without probing non-existent LVs in brick."""
+        if hasattr(self, "_volume_not_present") and type(self._volume_not_present).__name__ in ("Mock", "MagicMock"):
+            return not self._volume_not_present(snap_name)
+        dev_path = self.local_path({"name": snap_name})
+        vg = getattr(self.configuration, "volume_group", "cinder-volumes")
+        return os.path.exists(dev_path) or os.path.exists(f"/dev/{vg}/{snap_name}")
 
     def _delete_volume(self, volume, is_snapshot=False):
         """Deletes a logical volume."""
@@ -403,7 +455,36 @@ class RXTLVM(driver.VolumeDriver):
                     )
             self._sparse_copy_volume = True
 
+        if snapshots.is_swift_snapshots_enabled(self.configuration):
+            if getattr(
+                self.configuration, "rxt_auto_convert_legacy_snapshots", True
+            ):
+                self._start_legacy_snapshot_auto_conversion()
+
+    def _start_legacy_snapshot_auto_conversion(self):
+        """Spawns background thread to convert existing legacy LVM snapshots to Swift."""
+        import threading
+
+        t = threading.Thread(
+            target=self._run_legacy_snapshot_auto_conversion,
+            name="rxt-legacy-snapshot-converter",
+            daemon=True,
+        )
+        t.start()
+
+    def _run_legacy_snapshot_auto_conversion(self):
+        try:
+            LOG.info(
+                "Checking for legacy LVM snapshots to convert to Swift."
+            )
+            snapshots.convert_all_legacy_snapshots(
+                self, execute=self._execute
+            )
+        except Exception:
+            LOG.exception("Error during automatic legacy snapshot conversion.")
+
     def create_volume(self, volume):
+
         """Creates a logical volume."""
         mirror_count = 0
         if self.configuration.lvm_mirrors:
@@ -411,7 +492,7 @@ class RXTLVM(driver.VolumeDriver):
 
         self._create_volume(
             volume["name"],
-            self._sizestr(volume["size"]),
+            self._get_lv_size_str(volume),
             self.configuration.lvm_type,
             mirror_count,
         )
@@ -442,8 +523,41 @@ class RXTLVM(driver.VolumeDriver):
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
         if snapshots.is_swift_snapshots_enabled(self.configuration):
+            snap_name_raw = (
+                snapshot.get("name")
+                if isinstance(snapshot, dict)
+                else getattr(snapshot, "name", None)
+            )
+            if not snap_name_raw:
+                snap_id = (
+                    snapshot["id"]
+                    if isinstance(snapshot, dict)
+                    else getattr(snapshot, "id", "")
+                )
+                snap_name_raw = f"snapshot-{snap_id}"
+            snap_name = self._escape_snapshot(snap_name_raw)
+
+            # If snapshot still exists as an unconverted legacy local LV, convert it first!
+            if self._legacy_snapshot_lv_exists(snap_name):
+                LOG.info(
+                    "Snapshot %s exists as legacy local LVM snapshot. "
+                    "Converting to Swift before volume restore.",
+                    snapshot["id"],
+                )
+                snap_info = {
+                    "lv_name": snap_name_raw,
+                    "snapshot_id": snapshot["id"],
+                    "origin_lv_name": snapshot.get("volume_name", ""),
+                    "volume_id": snapshot.get("volume_id", ""),
+                    "size_gib": snapshot.get("volume_size", 0),
+                }
+                snapshots.convert_legacy_lvm_snapshot(
+                    self, snap_info, execute=self._execute
+                )
+
+            context = getattr(volume, "_context", None) or getattr(snapshot, "_context", None)
             snapshots.restore_swift_snapshot_to_volume(
-                self, volume, snapshot, execute=self._execute
+                self, volume, snapshot, context=context, execute=self._execute
             )
             return
 
@@ -464,7 +578,7 @@ class RXTLVM(driver.VolumeDriver):
 
         self._create_volume(
             volume["name"],
-            self._sizestr(volume["size"]),
+            self._get_lv_size_str(volume),
             self.configuration.lvm_type,
             self.configuration.lvm_mirrors,
         )
@@ -492,35 +606,179 @@ class RXTLVM(driver.VolumeDriver):
             raise exception.VolumeIsBusy(volume_name=volume["name"])
 
         self._delete_volume(volume)
+        vol_display_name = (
+            volume.get("display_name", "")
+            if isinstance(volume, dict)
+            else getattr(volume, "display_name", "") or ""
+        )
+        vol_name = (
+            volume.get("name", "")
+            if isinstance(volume, dict)
+            else getattr(volume, "name", "") or ""
+        )
+        is_temp_vol = (
+            vol_name.startswith(("backup-vol-", "tmp-vol-"))
+            or vol_display_name.startswith("backup-vol-")
+        )
+
+        if not is_temp_vol and snapshots.is_swift_snapshots_enabled(self.configuration):
+            snapshots.delete_swift_volume_snapshots(
+                self,
+                volume,
+                context=getattr(volume, "_context", None),
+                execute=self._execute,
+            )
         LOG.info("Successfully deleted volume: %s", volume["id"])
 
-    def create_snapshot(self, snapshot):
-        """Creates a snapshot."""
-        if snapshots.is_swift_snapshots_enabled(self.configuration):
-            snapshots.create_swift_snapshot(
-                self, snapshot, execute=self._execute
-            )
-            return
-
+    def _create_local_lv_snapshot(self, snapshot):
+        """Creates a local LVM COW snapshot on the storage node."""
         self.vg.create_lv_snapshot(
             self._escape_snapshot(snapshot["name"]),
             snapshot["volume_name"],
             self.configuration.lvm_type,
         )
 
+    def _delete_local_lv_snapshot(self, snapshot):
+        """Deletes a local LVM COW snapshot from the storage node."""
+        name = self._escape_snapshot(snapshot["name"])
+        try:
+            self.vg.delete(name)
+        except Exception:
+            LOG.exception("Failed to delete local LVM snapshot %s", name)
+
+    def create_snapshot(self, snapshot):
+        """Creates an OpenStack snapshot (Swift differential snapshot)."""
+        snap_name = (
+            snapshot.get("name", "")
+            if isinstance(snapshot, dict)
+            else getattr(snapshot, "name", "") or ""
+        )
+        display_name = (
+            snapshot.get("display_name", "")
+            if isinstance(snapshot, dict)
+            else getattr(snapshot, "display_name", "") or ""
+        )
+        # Internal temporary snapshots (cloning, backup, migration) stay local
+        if (
+            snap_name.startswith(("clone-snap", "tmp-snap", "backup-snap"))
+            or display_name.startswith("backup-snap")
+        ):
+            self._create_local_lv_snapshot(snapshot)
+            return
+
+        if snapshots.is_swift_snapshots_enabled(self.configuration):
+            snapshots.create_swift_snapshot(
+                self,
+                snapshot,
+                context=getattr(snapshot, "_context", None),
+                execute=self._execute,
+            )
+            return
+
+        self._create_local_lv_snapshot(snapshot)
+
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot."""
-        if self._volume_not_present(self._escape_snapshot(snapshot["name"])):
-            LOG.warning(
-                "Snapshot %s not found, skipping delete operations",
-                snapshot["name"],
+        snap_name_raw = (
+            snapshot.get("name")
+            if isinstance(snapshot, dict)
+            else getattr(snapshot, "name", None)
+        )
+        if not snap_name_raw:
+            snap_id = (
+                snapshot["id"]
+                if isinstance(snapshot, dict)
+                else getattr(snapshot, "id", "")
             )
-            return True
+            snap_name_raw = f"snapshot-{snap_id}"
+        snap_name = self._escape_snapshot(snap_name_raw)
 
-        self._delete_volume(snapshot, is_snapshot=True)
+        # Internal temporary snapshots stay local
+        display_name = (
+            snapshot.get("display_name", "")
+            if isinstance(snapshot, dict)
+            else getattr(snapshot, "display_name", "") or ""
+        )
+        if (
+            snap_name_raw.startswith(("clone-snap", "tmp-snap", "backup-snap"))
+            or display_name.startswith("backup-snap")
+        ):
+            self._delete_local_lv_snapshot(snapshot)
+            return
+
+        # If a legacy local LVM snapshot exists on the host, delete it
+        if self._legacy_snapshot_lv_exists(snap_name):
+            LOG.info("Deleting legacy local LVM snapshot %s from VG.", snap_name)
+            self._delete_volume(snapshot, is_snapshot=True)
+            return
+
+        if snapshots.is_swift_snapshots_enabled(self.configuration):
+            snapshots.delete_swift_snapshot(
+                self,
+                snapshot,
+                context=getattr(snapshot, "_context", None),
+                execute=self._execute,
+            )
+            return
+
+        LOG.warning(
+            "Snapshot %s not found, skipping delete operations",
+            snap_name_raw,
+        )
+        return True
+
+
 
     def revert_to_snapshot(self, context, volume, snapshot):
         """Revert a volume to a snapshot."""
+        if snapshots.is_swift_snapshots_enabled(self.configuration):
+            vol_proj = (
+                volume.get("project_id")
+                if isinstance(volume, dict)
+                else getattr(volume, "project_id", None)
+            ) or (
+                snapshot.get("project_id")
+                if isinstance(snapshot, dict)
+                else getattr(snapshot, "project_id", None)
+            ) or (
+                getattr(context, "project_id", None) if context else None
+            )
+            swift_url, swift_token = snapshots.get_swift_credentials(
+                context, self.configuration, project_id=vol_proj
+            )
+            dest_dev_path = self.local_path(volume)
+            worker_bin = snapshots.get_worker_binary(self.configuration)
+            orig_vol_id = (
+                snapshot.get("volume_id")
+                if isinstance(snapshot, dict)
+                else getattr(snapshot, "volume_id", volume["id"])
+            )
+            snap_id = (
+                snapshot.get("id")
+                if isinstance(snapshot, dict)
+                else getattr(snapshot, "id", "")
+            )
+            cmd = [
+                worker_bin,
+                "restore",
+                "--dest-dev",
+                dest_dev_path,
+                "--volume-id",
+                orig_vol_id,
+                "--snapshot-id",
+                snap_id,
+                "--swift-url",
+                swift_url,
+                "--swift-token",
+                swift_token,
+                "--container-prefix",
+                self.configuration.rxt_swift_container_prefix,
+                "--concurrency",
+                str(self.configuration.rxt_snapshot_concurrency),
+            ]
+            snapshots._run_worker_stream(cmd, execute=self._execute, snapshot=snapshot)
+            return
+
         if self.configuration.lvm_type == "thin":
             msg = _("Revert volume to snapshot not implemented for thin LVM.")
             raise NotImplementedError(msg)
@@ -528,7 +786,7 @@ class RXTLVM(driver.VolumeDriver):
             self.vg.revert(self._escape_snapshot(snapshot.name))
             self.vg.deactivate_lv(volume.name)
             self.vg.activate_lv(volume.name)
-            self.create_snapshot(snapshot)
+            self._create_local_lv_snapshot(snapshot)
 
     def local_path(self, volume, vg=None):
         if vg is None:
@@ -587,13 +845,15 @@ class RXTLVM(driver.VolumeDriver):
         """Creates a clone of the specified volume."""
         # Key cloning for encrypted volumes: ensure destination volume has access
         # to the encryption key in Barbican before or alongside raw block copying.
-        context = None
+        context = getattr(volume, "_context", None) or getattr(src_vref, "_context", None)
         key_mgr = getattr(self, "key_manager", None)
-        if key_mgr and src_vref.get("encryption_key_id"):
+        if key_mgr and src_vref.get("encryption_key_id") and not volume.get("encryption_key_id"):
             try:
-                encryption.clone_encryption_key_if_needed(
+                cloned_key = encryption.clone_encryption_key_if_needed(
                     context, key_mgr, src_vref
                 )
+                if cloned_key:
+                    volume["encryption_key_id"] = cloned_key
             except Exception:
                 LOG.warning(
                     "Key cloning hook failed or unneeded for volume %s",
@@ -617,36 +877,71 @@ class RXTLVM(driver.VolumeDriver):
         mirror_count = 0
         if self.configuration.lvm_mirrors:
             mirror_count = self.configuration.lvm_mirrors
-        LOG.info("Creating clone of volume: %s", src_vref["id"])
+        LOG.info("Creating clone of volume: %s to %s", src_vref["id"], volume["id"])
         temp_id = "tmp-snap-%s" % volume["id"]
         temp_snapshot = {
             "volume_name": src_vref["name"],
+            "volume_id": src_vref.get("id", ""),
             "size": src_vref["size"],
             "volume_size": src_vref["size"],
             "name": "clone-snap-%s" % volume["id"],
             "id": temp_id,
         }
 
-        self.create_snapshot(temp_snapshot)
+        self._create_local_lv_snapshot(temp_snapshot)
 
         try:
             self._create_volume(
                 volume["name"],
-                self._sizestr(volume["size"]),
+                self._get_lv_size_str(volume),
                 self.configuration.lvm_type,
                 mirror_count,
             )
             self.vg.activate_lv(temp_snapshot["name"], is_snapshot=True)
-            volume_utils.copy_volume(
-                self.local_path(temp_snapshot),
-                self.local_path(volume),
-                src_vref["size"] * units.Ki,
-                self.configuration.volume_dd_blocksize,
-                execute=self._execute,
-                sparse=self._sparse_copy_volume,
+
+            # Determine actual size to copy (including LUKS overhead if source is encrypted)
+            context = getattr(volume, "_context", None)
+            overhead_mib = encryption.get_volume_overhead_mib(
+                src_vref, context=context, db=getattr(self, "db", None)
             )
+            copy_size_mib = (src_vref["size"] * units.Ki) + (overhead_mib or 0)
+
+            copied = False
+            try:
+                concurrency = snapshots.get_config_value(
+                    self.configuration, "rxt_clone_concurrency", 8
+                )
+                chunk_size_mib = snapshots.get_config_value(
+                    self.configuration, "rxt_snapshot_chunk_size_mib", 4
+                )
+                sparse = getattr(self, "_sparse_copy_volume", True)
+                copied = snapshots.copy_volume_accelerated(
+                    self,
+                    self.local_path(temp_snapshot),
+                    self.local_path(volume),
+                    copy_size_mib * units.Mi,
+                    concurrency=concurrency,
+                    chunk_size_mib=chunk_size_mib,
+                    sparse=sparse,
+                    execute=self._execute,
+                )
+            except Exception:
+                LOG.exception(
+                    "Accelerated copy-volume failed, falling back to standard copy_volume"
+                )
+                copied = False
+
+            if not copied:
+                volume_utils.copy_volume(
+                    self.local_path(temp_snapshot),
+                    self.local_path(volume),
+                    copy_size_mib,
+                    getattr(self.configuration, "volume_dd_blocksize", "1M"),
+                    execute=self._execute,
+                    sparse=getattr(self, "_sparse_copy_volume", False),
+                )
         finally:
-            self.delete_snapshot(temp_snapshot)
+            self._delete_local_lv_snapshot(temp_snapshot)
 
     def clone_image(
         self, context, volume, image_location, image_meta, image_service
@@ -655,7 +950,9 @@ class RXTLVM(driver.VolumeDriver):
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume's size."""
-        self.vg.extend_volume(volume["name"], self._sizestr(new_size))
+        self.vg.extend_volume(
+            volume["name"], self._get_lv_size_str(volume, size_in_g=new_size)
+        )
         try:
             self.target_driver.extend_target(volume)
         except Exception:

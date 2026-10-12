@@ -43,3 +43,4 @@ etc/cinder.conf.sample
 doc/source/_static/cinder.policy.yaml.sample
 etc/cinder.policy.yaml.sample
 target/
+bin/

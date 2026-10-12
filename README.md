@@ -18,7 +18,7 @@ High-performance OpenStack Cinder LVM storage driver and differential snapshot e
 - **Barbican Key Cloning:** When cloning encrypted volumes, the driver clones Barbican secrets (`volume_utils.clone_encryption_key`) and performs fast raw block-level replication (`dd`) without mounting `dm-crypt` devices on the storage node.
 
 ### 3. Swift-Backed Differential Snapshots (Decoupled from Node)
-- **No Lingering LVM Snapshots:** Upstream LVM snapshots are tied to the physical storage node and become "boat anchors" that prevent operations teams from evacuating or migrating volumes off hypervisors and storage nodes. `cinder-rxt` creates a transient LVM snapshot, syncs changed 4MB differential chunks into OpenStack Swift, and **immediately destroys the local LVM snapshot**.
+- **No Lingering LVM Snapshots:** Upstream LVM snapshots remain tied to the physical storage node, creating volume dependencies that prevent operations teams from evacuating or migrating volumes off hypervisors and storage nodes. `cinder-rxt` creates a transient LVM snapshot, syncs changed 4MB differential chunks into OpenStack Swift, and **immediately deletes the local LVM snapshot**.
 - **O(1) Sharded Binary Diff Manifest:** Replaces legacy Lunr monolithic YAML manifests (which bloated to 2 GB and caused 65 GB Python OOM crashes) with an ultra-compact binary format (`RXTD`, 36 bytes per chunk delta). Handles 10 TB volumes in < 25 MB RAM.
 - **SIMD Zero-Block Elision:** Automatically skips unallocated or zeroed 4MB blocks, minimizing I/O and object storage consumption.
 
@@ -87,6 +87,7 @@ target_secondary_ip_addresses = 10.240.10.12,10.240.10.13
 
 # Swift Differential Snapshot Engine
 rxt_swift_snapshots_enabled = True
+rxt_auto_convert_legacy_snapshots = True
 rxt_swift_url = http://swift.openstack.svc.cluster.local:8080/v1/AUTH_cinder_snapshots
 rxt_swift_container = cinder_snapshots
 rxt_swift_auth_token =
@@ -95,6 +96,32 @@ rxt_worker_concurrency = 16
 ```
 
 > **Backward Compatibility:** Existing deployments referencing `volume_driver = cinder_rxt.rackspace.RXTLVM` or `target_helper = cinder_rxt.rackspace.RXTTgtAdm` continue to work without modification.
+
+---
+
+## Legacy Snapshot Conversion
+
+Under the legacy LVM snapshot paradigm, snapshots remain permanently on the physical storage host as LVM COW logical volumes (`snapshot-*`), creating local dependencies that prevent operations teams from evacuating or migrating volumes off hypervisors and storage nodes.
+
+`cinder-rxt` provides three complementary mechanisms to convert legacy snapshots into Swift differential snapshots and remove local LVM copy-on-write volume dependencies:
+
+1. **Automatic Startup Conversion:** When `rxt_auto_convert_legacy_snapshots = True` (default), the driver initiates an asynchronous background worker upon `cinder-volume` startup to discover all legacy snapshot LVs in the Volume Group, sync their 4MB differential chunks into Swift, and immediately destroy the local LVs.
+2. **On-The-Fly Fallback:** If a tenant creates a volume from an old, unconverted snapshot or deletes it, `RXTLVM` automatically converts the legacy snapshot to Swift on-the-fly before volume provisioning, and cleans up the local LV.
+3. **Operational CLI (`cinder-rxt-manage`):** Storage administrators can audit and execute conversions manually:
+   ```bash
+   # List all legacy snapshots currently on this node
+   cinder-rxt-manage list-legacy-snapshots --vg cinder-volumes
+
+   # Preview conversion without making any changes
+   cinder-rxt-manage convert-legacy-snapshots --vg cinder-volumes --dry-run
+
+   # Convert all legacy snapshots in the VG to Swift and purge local LVs
+   cinder-rxt-manage convert-legacy-snapshots --vg cinder-volumes
+
+   # Convert a single specific snapshot UUID
+   cinder-rxt-manage convert-legacy-snapshots --vg cinder-volumes --snapshot-id <uuid>
+   ```
+
 
 ---
 

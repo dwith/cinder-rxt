@@ -14,6 +14,9 @@
 
 use sha2::{Digest, Sha256};
 
+#[allow(dead_code)]
+pub const ZERO_CHUNK_HASH: [u8; 32] = [0u8; 32];
+
 pub fn compute_chunk_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);

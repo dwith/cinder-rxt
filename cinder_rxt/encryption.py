@@ -44,20 +44,106 @@ def get_luks_header_bytes(provider):
     return _LUKS1_HEADER_BYTES
 
 
+def get_luks_header_overhead_mib(provider=None):
+    """Return physical LVM padding in MiB needed for the LUKS header.
+
+    LUKS2 standard metadata+keyslots area is 16 MiB.
+    LUKS1 payload offset is 2 MiB, which aligns to 4 MiB on standard LVM extents.
+    Defaults to 16 MiB (LUKS2 standard).
+    """
+    if provider:
+        p = str(provider).lower()
+        if "luks2" in p:
+            return 16
+        elif "luks" in p or "plain" in p:
+            return 4
+    return 16
+
+
+def is_encrypted_volume(volume, context=None, db=None):
+    """Determine whether a volume is an encrypted volume."""
+    key_id = (
+        volume.get("encryption_key_id")
+        if isinstance(volume, dict)
+        else getattr(volume, "encryption_key_id", None)
+    )
+    if key_id:
+        return True
+
+    vol_id = (
+        volume.get("id")
+        if isinstance(volume, dict)
+        else getattr(volume, "id", None)
+    )
+    if db and vol_id and context:
+        try:
+            encryption = db.volume_encryption_metadata_get(context, vol_id)
+            if encryption and (
+                encryption.get("encryption_key_id")
+                or encryption.get("provider")
+            ):
+                return True
+        except Exception:
+            pass
+
+    vol_type_id = (
+        volume.get("volume_type_id")
+        if isinstance(volume, dict)
+        else getattr(volume, "volume_type_id", None)
+    )
+    if vol_type_id and context:
+        try:
+            from cinder.volume import volume_types
+
+            if volume_types.is_encrypted(context, vol_type_id):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def get_volume_overhead_mib(volume, context=None, db=None):
+    """Return the extra physical overhead in MiB required for the volume.
+
+    Returns 0 if the volume is unencrypted.
+    Returns 16 MiB (or 4 MiB) for encrypted volumes so that the decrypted
+    dm-crypt plaintext payload provides the full requested nominal capacity.
+    """
+    if not is_encrypted_volume(volume, context=context, db=db):
+        return 0
+
+    provider = None
+    vol_id = (
+        volume.get("id")
+        if isinstance(volume, dict)
+        else getattr(volume, "id", None)
+    )
+    if db and vol_id and context:
+        try:
+            encryption = db.volume_encryption_metadata_get(context, vol_id)
+            if encryption:
+                provider = encryption.get("provider")
+        except Exception:
+            pass
+
+    return get_luks_header_overhead_mib(provider)
+
+
 def check_image_fits_encrypted_volume(
     context, volume, image_service, image_id, db=None
 ):
-    """Raise ImageTooBig if the image cannot fit the LUKS payload.
+    """Validate that an image fits the nominal volume size.
 
-    Under upstream LVM sizing, the LUKS header is carved out of the requested
-    size. If an image's virtual size exceeds the nominal volume size minus the
-    LUKS header, qemu-img convert will fail late with "Cannot grow device files".
-    More critically, attempting to resize/shrink the LV after writing truncates
-    the end of full-sized images (corrupting GPT backup headers and root filesystems,
-    causing boot failures; see OSPC-2358).
+    Because the RXT LVM driver compensates for the LUKS header at LV allocation
+    time (adding the header overhead to the physical LV), the decrypted dm-crypt
+    device provides the full nominal volume size (volume['size'] * GiB) as usable
+    payload.
 
-    This pre-check fails fast before downloading any image data, giving the user
-    an actionable error specifying the minimum GiB needed.
+    Therefore, an image whose virtual size equals the requested volume size
+    (such as a 40 GiB image on a 40 GiB root volume) fits natively without
+    truncation or ImageTooBig rejection. We only reject if the image actually
+    exceeds the full nominal volume size.
     """
     try:
         image_meta = image_service.show(context, image_id)
@@ -75,51 +161,32 @@ def check_image_fits_encrypted_volume(
         return
     virtual_size = int(virtual_size)
 
-    # An image uploaded from an encrypted volume is already a LUKS container;
-    # its virtual size already includes the header, so nominal size check applies.
-    if image_meta.get("cinder_encryption_key_id"):
+    volume_size_gib = (
+        volume.get("size")
+        if isinstance(volume, dict)
+        else getattr(volume, "size", 0)
+    )
+    nominal_bytes = int(volume_size_gib) * units.Gi
+
+    if virtual_size <= nominal_bytes:
         return
 
-    provider = None
+    min_gib = int(math.ceil(virtual_size / float(units.Gi)))
     vol_id = volume.get("id") if isinstance(volume, dict) else getattr(volume, "id", None)
-    if db and vol_id:
-        try:
-            encryption = db.volume_encryption_metadata_get(context, vol_id)
-            provider = (encryption or {}).get("provider")
-        except Exception:
-            LOG.debug(
-                "Unable to read encryption metadata from DB for volume %s; "
-                "assuming LUKS1 header.",
-                vol_id,
-                exc_info=True,
-            )
-
-    header = get_luks_header_bytes(provider)
-    volume_size_gib = volume.get("size") if isinstance(volume, dict) else getattr(volume, "size", 0)
-    nominal = int(volume_size_gib) * units.Gi
-    usable = nominal - header
-
-    if virtual_size <= usable:
-        return
-
-    min_gib = int(math.ceil((virtual_size + header) / float(units.Gi)))
     reason = (
-        "image virtual size %(vsize)d bytes exceeds the usable capacity "
-        "of encrypted volume %(vol)s (%(nominal)d GiB requested minus "
-        "%(header)d MiB LUKS header = %(usable)d bytes). Encrypted "
-        "volumes lose the LUKS header from the requested size; request "
-        "a volume of at least %(min_gib)d GiB for this image."
+        "Image virtual size %(vsize)d bytes exceeds the nominal capacity "
+        "of encrypted volume %(vol)s (%(nominal)d GiB / %(nominal_bytes)d bytes). "
+        "Request a volume of at least %(min_gib)d GiB for this image."
         % {
             "vsize": virtual_size,
             "vol": vol_id,
             "nominal": int(volume_size_gib),
-            "header": header // units.Mi,
-            "usable": usable,
+            "nominal_bytes": nominal_bytes,
             "min_gib": min_gib,
         }
     )
     LOG.error(
-        "Image %(image)s does not fit encrypted volume: %(reason)s",
+        "Image %(image)s does not fit volume: %(reason)s",
         {"image": image_id, "reason": reason},
     )
     raise exception.ImageTooBig(image_id=image_id, reason=reason)
