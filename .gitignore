@@ -42,3 +42,4 @@ etc/cinder.conf.sample
 # sample policy file included in docs
 doc/source/_static/cinder.policy.yaml.sample
 etc/cinder.policy.yaml.sample
+target/

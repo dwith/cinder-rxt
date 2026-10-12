@@ -1,173 +1,444 @@
+# Copyright 2024 Cloudnull <kevin@cloudnull.com>
+# Copyright 2026 Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
 import unittest
 from unittest import mock
 
-from oslo_concurrency import processutils as putils
 from oslo_utils import units
 
-from cinder_rxt.rackspace import RXTLVM, _LUKS_HEADER_BYTES
+from cinder import exception
+from cinder.volume import driver
+from cinder.volume.targets import tgt
+
+from cinder_rxt import encryption
+from cinder_rxt import lvm
+from cinder_rxt import rackspace
+from cinder_rxt import targets
+
+GI = units.Gi
+MI = units.Mi
 
 
-class FakeVG:
-    LVM_CMD_PREFIX = ["env", "LC_ALL=C"]
+class FakeVolume(dict):
+    """Dictionary supporting attribute access, matching Cinder Volume objects."""
 
-    def __init__(self, extent_size_mib=4):
-        self._extent_size_mib = extent_size_mib
-        self.vg_name = "fake-vg"
-        self._root_helper = "sudo cinder-rootwrap /etc/cinder/rootwrap.conf"
-
-    def _execute(self, *args, **kwargs):
-        """Simulate vgs command for extent size queries."""
-        if "vg_extent_size" in args:
-            return ("  %s\n" % self._extent_size_mib, "")
-        return ("", "")
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
 
 
-class TestCopyImageToEncryptedVolume(unittest.TestCase):
-    """Tests for the LUKS header compensation in copy_image_to_encrypted_volume."""
+def enc_vol(size=40, key_id="key-123"):
+    return FakeVolume(
+        id="vol-enc-uuid",
+        name="volume-vol-enc-uuid",
+        size=size,
+        encryption_key_id=key_id,
+    )
 
-    def _make_driver(self):
-        """Create an RXTLVM instance without running the real __init__."""
-        drv = RXTLVM.__new__(RXTLVM)
-        drv.vg = FakeVG()
-        drv._sparse_copy_volume = False
-        drv._execute = lambda *a, **k: None
-        drv._sizestr = lambda sz: "%sg" % sz
+
+class TestRXTTgtAdm(unittest.TestCase):
+    """Tests for the RXTTgtAdm target driver (multipath and scsi_sn/scsi_id)."""
+
+    def test_secondary_ip_support_enabled(self):
+        self.assertTrue(targets.RXTTgtAdm.SECONDARY_IP_SUPPORT)
+
+    @mock.patch.object(tgt.TgtAdm, "create_iscsi_target")
+    def test_create_iscsi_target_injects_scsi_id_and_sn(self, mock_super_create):
+        conf = mock.Mock()
+        conf.iscsi_write_cache = "on"
+        conf.target_prefix = "iqn.2010-10.org.openstack:"
+
+        target_helper = targets.RXTTgtAdm(configuration=conf)
+        target_name = "iqn.2010-10.org.openstack:vol-uuid-456"
+
+        target_helper.create_iscsi_target(
+            name=target_name,
+            tid=1,
+            lun=1,
+            path="/dev/mapper/cinder--volumes-vol--uuid--456",
+        )
+
+        mock_super_create.assert_called_once_with(
+            target_name,
+            1,
+            1,
+            "/dev/mapper/cinder--volumes-vol--uuid--456",
+            None,
+        )
+
+        # After execution, VOLUME_CONF must have been restored
+        self.assertIn("scsi_sn", target_helper.VOLUME_CONF)
+
+
+class TestEncryptionModule(unittest.TestCase):
+    """Tests for LUKS header calculation, pre-flight checks, and key cloning."""
+
+    def test_luks1_header_bytes(self):
+        for p in ("luks", "LUKS", "os_brick.encryptors.luks.LuksEncryptor"):
+            self.assertEqual(
+                encryption._LUKS1_HEADER_BYTES,
+                encryption.get_luks_header_bytes(p),
+            )
+
+    def test_luks2_header_bytes(self):
+        for p in ("luks2", "LUKS2", "os_brick.encryptors.luks.Luks2Encryptor"):
+            self.assertEqual(
+                encryption._LUKS2_HEADER_BYTES,
+                encryption.get_luks_header_bytes(p),
+            )
+
+    def test_unknown_provider_defaults_to_smallest_header(self):
+        self.assertEqual(
+            encryption._LUKS1_HEADER_BYTES,
+            encryption.get_luks_header_bytes(None),
+        )
+        self.assertEqual(
+            encryption._LUKS1_HEADER_BYTES,
+            encryption.get_luks_header_bytes(""),
+        )
+        self.assertEqual(
+            encryption._LUKS1_HEADER_BYTES,
+            encryption.get_luks_header_bytes("plain"),
+        )
+
+    def test_check_image_fits_small_image_passes(self):
+        img_svc = mock.Mock()
+        img_svc.show.return_value = {"id": "img-1", "virtual_size": 4 * GI}
+        vol = enc_vol(size=40)
+
+        # Should not raise
+        encryption.check_image_fits_encrypted_volume(
+            mock.sentinel.ctx, vol, img_svc, "img-1"
+        )
+
+    def test_check_image_fits_exact_usable_passes(self):
+        img_svc = mock.Mock()
+        # Exactly 40 GiB minus 2 MiB LUKS1 header
+        img_svc.show.return_value = {
+            "id": "img-1",
+            "virtual_size": 40 * GI - 2 * MI,
+        }
+        vol = enc_vol(size=40)
+
+        # Should not raise
+        encryption.check_image_fits_encrypted_volume(
+            mock.sentinel.ctx, vol, img_svc, "img-1"
+        )
+
+    def test_check_image_oversized_raises_image_too_big(self):
+        img_svc = mock.Mock()
+        # Full 40 GiB image for 40 GiB volume (missing LUKS header space)
+        img_svc.show.return_value = {
+            "id": "img-oversized",
+            "virtual_size": 40 * GI,
+        }
+        vol = enc_vol(size=40)
+
+        with self.assertRaises(exception.ImageTooBig) as cm:
+            encryption.check_image_fits_encrypted_volume(
+                mock.sentinel.ctx, vol, img_svc, "img-oversized"
+            )
+
+        msg = str(cm.exception)
+        self.assertIn("img-oversized", msg)
+        self.assertIn("2 MiB LUKS header", msg)
+        self.assertIn("at least 41 GiB", msg)
+
+    def test_check_image_luks2_provider_uses_16mib_header(self):
+        img_svc = mock.Mock()
+        # Fits LUKS1 (2 MiB) but exceeds LUKS2 (16 MiB)
+        img_svc.show.return_value = {
+            "id": "img-luks2",
+            "virtual_size": 40 * GI - 8 * MI,
+        }
+        db = mock.Mock()
+        db.volume_encryption_metadata_get.return_value = {"provider": "luks2"}
+        vol = enc_vol(size=40)
+
+        with self.assertRaises(exception.ImageTooBig) as cm:
+            encryption.check_image_fits_encrypted_volume(
+                mock.sentinel.ctx, vol, img_svc, "img-luks2", db=db
+            )
+
+        self.assertIn("16 MiB LUKS header", str(cm.exception))
+
+    def test_check_image_missing_virtual_size_skips(self):
+        img_svc = mock.Mock()
+        img_svc.show.return_value = {"id": "img-nosize"}
+        vol = enc_vol(size=40)
+
+        # Should return silently without raising
+        encryption.check_image_fits_encrypted_volume(
+            mock.sentinel.ctx, vol, img_svc, "img-nosize"
+        )
+
+    @mock.patch("cinder.volume.volume_utils.clone_encryption_key")
+    def test_clone_encryption_key_success(self, mock_clone):
+        mock_clone.return_value = "cloned-key-789"
+        key_mgr = mock.Mock()
+        src_vol = enc_vol(key_id="source-key-123")
+
+        result = encryption.clone_encryption_key_if_needed(
+            mock.sentinel.ctx, key_mgr, src_vol
+        )
+
+        self.assertEqual("cloned-key-789", result)
+        mock_clone.assert_called_once_with(
+            mock.sentinel.ctx, key_mgr, "source-key-123"
+        )
+
+    def test_clone_encryption_key_unencrypted_returns_none(self):
+        plain_vol = FakeVolume(id="plain", name="plain", size=10)
+        key_mgr = mock.Mock()
+
+        result = encryption.clone_encryption_key_if_needed(
+            mock.sentinel.ctx, key_mgr, plain_vol
+        )
+
+        self.assertIsNone(result)
+
+
+class TestRXTLVMFork(unittest.TestCase):
+    """Tests for the standalone RXTLVM driver."""
+
+    def setUp(self):
+        super().setUp()
+        self.drv = lvm.RXTLVM.__new__(lvm.RXTLVM)
+        self.drv.vg = mock.Mock()
+        self.drv.vg.vg_name = "cinder-volumes"
+        self.drv.db = mock.Mock()
+        self.drv.db.volume_encryption_metadata_get.return_value = {
+            "provider": "luks"
+        }
+        self.drv._execute = mock.Mock()
+        self.drv.backend_name = "LVM"
+        self.drv.hostname = "storage-node-1"
+        self.drv._sparse_copy_volume = False
 
         class Conf:
-            volume_dd_blocksize = 1
-            volume_group = "fake-vg"
+            volume_group = "cinder-volumes"
+            lvm_type = "default"
+            lvm_mirrors = 0
+            volume_dd_blocksize = "1M"
+            volume_clear = "zero"
+            volume_clear_size = 0
+            volume_clear_ionice = None
             use_multipath_for_image_xfer = False
             enforce_multipath_for_image_xfer = False
+            target_helper = "tgtadm"
 
-        drv.configuration = Conf()
-        return drv
+        self.drv.configuration = Conf()
+        self.drv.target_driver = mock.Mock()
 
-    def test_get_extent_size_bytes(self):
-        drv = self._make_driver()
-        # Default FakeVG has 4 MiB extents
-        self.assertEqual(4 * units.Mi, drv._get_extent_size_bytes())
+    def test_driver_inherits_from_base_volume_driver(self):
+        """Verify the driver is decoupled from upstream LVMVolumeDriver."""
+        self.assertTrue(issubclass(lvm.RXTLVM, driver.VolumeDriver))
 
-    def test_get_extent_size_bytes_custom(self):
-        drv = self._make_driver()
-        drv.vg = FakeVG(extent_size_mib=8)
-        self.assertEqual(8 * units.Mi, drv._get_extent_size_bytes())
+    def test_backward_compatibility_exports(self):
+        """Verify rackspace.py exports the exact expected classes and symbols."""
+        self.assertIs(rackspace.RXTLVM, lvm.RXTLVM)
+        self.assertIs(rackspace.RXTTgtAdm, targets.RXTTgtAdm)
+        self.assertEqual(rackspace._LUKS1_HEADER_BYTES, 2 * units.Mi)
+        self.assertEqual(rackspace._LUKS2_HEADER_BYTES, 16 * units.Mi)
 
-    @mock.patch("cinder_rxt.rackspace.putils.execute")
-    def test_lvresize_calls_correct_command(self, mock_execute):
-        drv = self._make_driver()
-        volume = {"id": "v1", "name": "vol-1", "size": 10}
-
-        drv._lvresize(volume, "10g")
-
-        mock_execute.assert_called_once_with(
-            "lvresize", "-f", "-L", "10g", "fake-vg/vol-1",
-            run_as_root=True, root_helper=drv.vg._root_helper)
-
-    @mock.patch("cinder_rxt.rackspace.putils.execute")
-    def test_extends_lv_before_image_copy_and_shrinks_after(
-        self, mock_lvresize_execute
+    def test_copy_image_to_encrypted_volume_prechecks_and_copies_without_resize(
+        self,
     ):
-        drv = self._make_driver()
-        volume = {"id": "v1", "name": "vol-enc", "size": 40}
+        """Verify fail-fast check is called and LV is NEVER resized or shrunk."""
+        img_svc = mock.Mock()
+        img_svc.show.return_value = {"id": "img-1", "virtual_size": 4 * GI}
+        vol = enc_vol(size=40)
 
-        drv.extend_volume = mock.Mock()
-        drv._copy_image_data_to_volume = mock.Mock()
+        self.drv._copy_image_data_to_volume = mock.Mock()
 
-        drv.copy_image_to_encrypted_volume(
+        self.drv.copy_image_to_encrypted_volume(
             context=mock.sentinel.ctx,
-            volume=volume,
-            image_service=mock.sentinel.img_svc,
+            volume=vol,
+            image_service=img_svc,
             image_id="img-1",
         )
 
-        # LV should be extended before the copy
-        drv.extend_volume.assert_called_once()
-        _, extended_gb = drv.extend_volume.call_args[0]
-        # With 4 MiB extents and 16 MiB LUKS header: 4 extra extents
-        expected_extra = 4 * 4 * units.Mi  # 16 MiB
-        expected_gb = (40 * units.Gi + expected_extra) / float(units.Gi)
-        self.assertAlmostEqual(extended_gb, expected_gb, places=6)
-
-        # Image copy should have been called with encrypted=True
-        drv._copy_image_data_to_volume.assert_called_once_with(
-            mock.sentinel.ctx, volume, mock.sentinel.img_svc, "img-1",
-            encrypted=True, disable_sparse=False,
+        # Base copy was called with encrypted=True
+        self.drv._copy_image_data_to_volume.assert_called_once_with(
+            mock.sentinel.ctx,
+            vol,
+            img_svc,
+            "img-1",
+            encrypted=True,
+            disable_sparse=False,
         )
 
-        # LV should be shrunk back after the copy
-        mock_lvresize_execute.assert_called_once()
-        args = mock_lvresize_execute.call_args[0]
-        self.assertEqual("lvresize", args[0])
-        # Target size should be the original volume size
-        self.assertEqual("40g", args[3])
+        # Verification: extend_volume was NEVER called
+        self.drv.vg.extend_volume.assert_not_called()
 
-    @mock.patch("cinder_rxt.rackspace.putils.execute")
-    def test_shrinks_lv_even_when_image_copy_fails(
-        self, mock_lvresize_execute
+    def test_copy_image_to_encrypted_volume_rejects_oversized_before_copy(
+        self,
     ):
-        drv = self._make_driver()
-        volume = {"id": "v2", "name": "vol-fail", "size": 10}
+        img_svc = mock.Mock()
+        img_svc.show.return_value = {
+            "id": "img-bad",
+            "virtual_size": 40 * GI,
+        }
+        vol = enc_vol(size=40)
 
-        drv.extend_volume = mock.Mock()
-        drv._copy_image_data_to_volume = mock.Mock(
-            side_effect=Exception("image copy failed")
-        )
+        self.drv._copy_image_data_to_volume = mock.Mock()
 
-        with self.assertRaises(Exception, msg="image copy failed"):
-            drv.copy_image_to_encrypted_volume(
+        with self.assertRaises(exception.ImageTooBig):
+            self.drv.copy_image_to_encrypted_volume(
                 context=mock.sentinel.ctx,
-                volume=volume,
-                image_service=mock.sentinel.img_svc,
-                image_id="img-2",
+                volume=vol,
+                image_service=img_svc,
+                image_id="img-bad",
             )
 
-        # LV should still be shrunk back despite the failure
-        mock_lvresize_execute.assert_called_once()
+        self.drv._copy_image_data_to_volume.assert_not_called()
 
-    @mock.patch("cinder_rxt.rackspace.putils.execute")
-    def test_lvresize_failure_is_non_fatal(self, mock_execute):
-        """If lvresize fails after image copy, log warning but don't raise."""
-        mock_execute.side_effect = putils.ProcessExecutionError(
-            exit_code=1, stderr="lvresize failed")
-        drv = self._make_driver()
-        volume = {"id": "v3", "name": "vol-shrink-fail", "size": 10}
-
-        drv.extend_volume = mock.Mock()
-        drv._copy_image_data_to_volume = mock.Mock()
-
-        # Should not raise
-        drv.copy_image_to_encrypted_volume(
-            context=mock.sentinel.ctx,
-            volume=volume,
-            image_service=mock.sentinel.img_svc,
-            image_id="img-3",
+    def test_create_volume(self):
+        volume = {"name": "vol-1", "size": 10}
+        self.drv.create_volume(volume)
+        self.drv.vg.create_volume.assert_called_once_with(
+            "vol-1", "10g", "default", 0
         )
 
-        # Image copy should have succeeded
-        drv._copy_image_data_to_volume.assert_called_once()
+    def test_extend_volume_calls_vg_and_target_driver(self):
+        volume = FakeVolume(id="v1", name="vol-extend", size=10)
+        self.drv.extend_volume(volume, 20)
 
-    @mock.patch("cinder_rxt.rackspace.putils.execute")
-    def test_extra_extents_scale_with_pe_size(self, mock_lvresize_execute):
-        """With larger PE sizes, fewer extents are needed."""
-        drv = self._make_driver()
-        # 16 MiB extents: only 1 extent needed for 16 MiB LUKS header
-        drv.vg = FakeVG(extent_size_mib=16)
-        volume = {"id": "v4", "name": "vol-big-pe", "size": 10}
+        self.drv.vg.extend_volume.assert_called_once_with("vol-extend", "20g")
+        self.drv.target_driver.extend_target.assert_called_once_with(volume)
 
-        drv.extend_volume = mock.Mock()
-        drv._copy_image_data_to_volume = mock.Mock()
+    def test_delete_volume_unpresent_returns_true(self):
+        self.drv.vg.get_volume.return_value = None
+        self.assertTrue(self.drv.delete_volume({"name": "vol-ghost"}))
 
-        drv.copy_image_to_encrypted_volume(
-            context=mock.sentinel.ctx,
-            volume=volume,
-            image_service=mock.sentinel.img_svc,
-            image_id="img-4",
+
+class TestSwiftSnapshots(unittest.TestCase):
+    """Tests for the Swift-backed decoupled snapshot subsystem."""
+
+    def setUp(self):
+        super().setUp()
+        self.drv = lvm.RXTLVM.__new__(lvm.RXTLVM)
+        self.drv.vg = mock.Mock()
+        self.drv.vg.vg_name = "cinder-volumes"
+        self.drv._escape_snapshot = lambda s: s
+        self.drv._sizestr = lambda sz: "%sg" % sz
+        self.drv.local_path = lambda v: "/dev/mapper/cinder--volumes-%s" % v["name"]
+        self.drv._create_volume = mock.Mock()
+        self.drv._execute = mock.Mock(return_value=('{"status":"ok"}', ""))
+
+        class Conf:
+            volume_group = "cinder-volumes"
+            lvm_type = "default"
+            lvm_mirrors = 0
+            rxt_swift_snapshots_enabled = True
+            rxt_swift_url = "http://swift.internal:8080/v1/AUTH_test"
+            rxt_swift_container_prefix = "cinder-snapshots-"
+            rxt_worker_path = "cinder-rxt-worker"
+            rxt_snapshot_concurrency = 16
+            rxt_snapshot_chunk_size_mib = 4
+
+        self.drv.configuration = Conf()
+
+    @mock.patch("cinder_rxt.snapshots.get_swift_credentials")
+    @mock.patch("shutil.which")
+    def test_create_swift_snapshot_creates_and_immediately_destroys_transient_lv(
+        self, mock_which, mock_get_creds
+    ):
+        mock_which.return_value = "/usr/local/bin/cinder-rxt-worker"
+        mock_get_creds.return_value = (
+            "http://swift.internal:8080/v1/AUTH_test",
+            "fake-token",
+        )
+        snapshot = {
+            "id": "snap-uuid-1",
+            "volume_id": "vol-uuid-1",
+            "volume_name": "volume-vol-uuid-1",
+            "volume_size": 20,
+        }
+
+        self.drv.create_snapshot(snapshot)
+
+        # Transient snapshot was created and activated
+        self.drv.vg.create_lv_snapshot.assert_called_once_with(
+            "tmp-rxt-snap-snap-uuid-1", "volume-vol-uuid-1", "default"
+        )
+        self.drv.vg.activate_lv.assert_called_once_with(
+            "tmp-rxt-snap-snap-uuid-1", is_snapshot=True
         )
 
-        _, extended_gb = drv.extend_volume.call_args[0]
-        # 1 extent of 16 MiB
-        expected_gb = (10 * units.Gi + 16 * units.Mi) / float(units.Gi)
-        self.assertAlmostEqual(extended_gb, expected_gb, places=6)
+        # Rust worker was invoked
+        self.drv._execute.assert_called_once()
+        args = self.drv._execute.call_args[0]
+        self.assertEqual("/usr/local/bin/cinder-rxt-worker", args[0])
+        self.assertEqual("sync-diff", args[1])
+        self.assertIn("--source-dev", args)
+        self.assertIn("--snapshot-id", args)
+        self.assertIn("snap-uuid-1", args)
+
+        # CRITICAL: Transient snapshot was deleted immediately after sync
+        self.drv.vg.delete.assert_called_once_with("tmp-rxt-snap-snap-uuid-1")
+
+    @mock.patch("cinder_rxt.snapshots.get_swift_credentials")
+    @mock.patch("shutil.which")
+    def test_restore_swift_snapshot_to_volume(self, mock_which, mock_get_creds):
+        mock_which.return_value = "/usr/local/bin/cinder-rxt-worker"
+        mock_get_creds.return_value = (
+            "http://swift.internal:8080/v1/AUTH_test",
+            "fake-token",
+        )
+        volume = {"name": "volume-target-uuid", "size": 20}
+        snapshot = {
+            "id": "snap-uuid-1",
+            "volume_id": "vol-uuid-1",
+            "volume_name": "volume-vol-uuid-1",
+            "volume_size": 20,
+        }
+
+        self.drv.create_volume_from_snapshot(volume, snapshot)
+
+        # Destination volume created
+        self.drv._create_volume.assert_called_once_with(
+            "volume-target-uuid", "20g", "default", 0
+        )
+
+        # Rust worker invoked to restore chunks
+        self.drv._execute.assert_called_once()
+        args = self.drv._execute.call_args[0]
+        self.assertEqual("restore", args[1])
+        self.assertIn("--dest-dev", args)
+        self.assertIn("/dev/mapper/cinder--volumes-volume-target-uuid", args)
+
+    def test_disabled_swift_snapshots_uses_local_lvm_snapshot(self):
+        self.drv.configuration.rxt_swift_snapshots_enabled = False
+        snapshot = {
+            "id": "snap-local",
+            "volume_id": "vol-1",
+            "name": "snapshot-snap-local",
+            "volume_name": "vol-1",
+            "volume_size": 10,
+        }
+
+        self.drv.create_snapshot(snapshot)
+
+        self.drv.vg.create_lv_snapshot.assert_called_once_with(
+            "snapshot-snap-local", "vol-1", "default"
+        )
+        # Transient delete was NOT called
+        self.drv.vg.delete.assert_not_called()
 
 
 if __name__ == "__main__":
