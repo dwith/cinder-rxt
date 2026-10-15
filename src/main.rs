@@ -24,10 +24,121 @@ use manifest::{SnapshotEntry, SnapshotManifest, VolumeManifestMeta};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use swift::SwiftClient;
 use tracing::info;
+
+#[allow(dead_code)]
+struct UploadChunk {
+    chunk_idx: u32,
+    chunk_hash: [u8; 32],
+    data: Vec<u8>,
+    bytes: u64,
+}
+
+#[allow(dead_code)]
+enum ScanChunk {
+    Zero {
+        chunk_idx: u32,
+        bytes: u64,
+    },
+    Data {
+        chunk_idx: u32,
+        chunk_hash: [u8; 32],
+        buf: Vec<u8>,
+        bytes: u64,
+    },
+}
+
+#[derive(Clone)]
+struct ProgressReporter {
+    start_time: Instant,
+    total_chunks: u32,
+    snapshot_id: String,
+    last_log: Arc<Mutex<Instant>>,
+    scanned_chunks: Arc<AtomicU32>,
+    scanned_bytes: Arc<AtomicU64>,
+    queued_chunks: Arc<AtomicU32>,
+    uploaded_chunks: Arc<AtomicU32>,
+    uploaded_bytes: Arc<AtomicU64>,
+    scan_finished: Arc<AtomicBool>,
+}
+
+impl ProgressReporter {
+    fn new(total_chunks: u32, snapshot_id: String) -> Self {
+        Self {
+            start_time: Instant::now(),
+            total_chunks,
+            snapshot_id,
+            last_log: Arc::new(Mutex::new(Instant::now())),
+            scanned_chunks: Arc::new(AtomicU32::new(0)),
+            scanned_bytes: Arc::new(AtomicU64::new(0)),
+            queued_chunks: Arc::new(AtomicU32::new(0)),
+            uploaded_chunks: Arc::new(AtomicU32::new(0)),
+            uploaded_bytes: Arc::new(AtomicU64::new(0)),
+            scan_finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn report(&self, force: bool) {
+        let mut last = self.last_log.lock().unwrap();
+        if force || last.elapsed() >= Duration::from_secs(5) {
+            *last = Instant::now();
+            let elapsed = self.start_time.elapsed().as_secs_f64();
+            let sc = self.scanned_chunks.load(Ordering::Relaxed);
+            let sc_b = self.scanned_bytes.load(Ordering::Relaxed);
+            let qc = self.queued_chunks.load(Ordering::Relaxed);
+            let up = self.uploaded_chunks.load(Ordering::Relaxed);
+            let up_b = self.uploaded_bytes.load(Ordering::Relaxed);
+            let is_done = self.scan_finished.load(Ordering::Relaxed);
+
+            let scan_pct = if self.total_chunks > 0 {
+                (sc as f64 / self.total_chunks as f64) * 100.0
+            } else {
+                100.0
+            };
+            let scan_mbps = if elapsed > 0.0 {
+                (sc_b as f64 / 1_048_576.0) / elapsed
+            } else {
+                0.0
+            };
+            let up_mbps = if elapsed > 0.0 {
+                (up_b as f64 / 1_048_576.0) / elapsed
+            } else {
+                0.0
+            };
+
+            let overall_pct = if is_done {
+                if qc == 0 {
+                    100.0
+                } else {
+                    50.0 + (up as f64 / qc as f64) * 50.0
+                }
+            } else {
+                let up_ratio = if qc > 0 {
+                    (up as f64 / qc as f64).min(1.0)
+                } else {
+                    1.0
+                };
+                let scan_factor = if self.total_chunks > 0 {
+                    sc as f64 / self.total_chunks as f64
+                } else {
+                    1.0
+                };
+                scan_factor * 50.0 + (up_ratio * scan_factor * 50.0)
+            };
+
+            info!(
+                "Snapshot {}: scan {}/{} ({:.1}%, {:.1} MB/s) | upload {}/{} changed ({:.1} MB/s) | overall: {:.0}%",
+                self.snapshot_id, sc, self.total_chunks, scan_pct, scan_mbps, up, qc, up_mbps, overall_pct
+            );
+            println!("PROGRESS: {:.0}%", overall_pct.floor());
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "cinder-rxt-worker")]
@@ -230,168 +341,167 @@ async fn main() -> Result<()> {
                 HashMap::new()
             };
 
-            let mut new_manifest = SnapshotManifest::new(snapshot_id.clone(), volume_id.clone(), total_chunks);
-            let mut chunks_to_upload: Vec<(u32, [u8; 32])> = Vec::new();
+            let concurrency = concurrency.max(1);
+            let channel_capacity = (concurrency * 2).max(16);
+            let reporter = ProgressReporter::new(total_chunks, snapshot_id.clone());
 
-            let scan_start = std::time::Instant::now();
-            let mut last_scan_log = std::time::Instant::now();
-            let mut scanned = 0usize;
-            let mut scanned_bytes = 0u64;
+            let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadChunk>(channel_capacity);
 
-            // Parallel volume scan and SHA-256 calculation across Tokio blocking thread pool
-            let mut scan_stream = stream::iter(0..total_chunks)
-                .map(|chunk_idx| {
-                    let file = Arc::clone(&file);
-                    async move {
-                        tokio::task::spawn_blocking(move || -> Result<(u32, Option<[u8; 32]>)> {
-                            let offset = chunk_idx as u64 * chunk_size as u64;
-                            let bytes_to_read = std::cmp::min(chunk_size as u64, total_bytes - offset) as usize;
-                            let mut buf = vec![0u8; bytes_to_read];
-                            block_io::read_chunk_at(&file, offset, &mut buf)?;
+            let reporter_scan = reporter.clone();
+            let file_scan = Arc::clone(&file);
+            let base_map = Arc::new(base_map);
+            let base_map_scan = Arc::clone(&base_map);
+            let snapshot_id_scan = snapshot_id.clone();
+            let volume_id_scan = volume_id.clone();
 
-                            if block_io::is_all_zeros(&buf) {
-                                Ok((chunk_idx, None))
+            let scan_future = async move {
+                let mut new_manifest = SnapshotManifest::new(snapshot_id_scan, volume_id_scan, total_chunks);
+                let mut known_hashes: HashSet<[u8; 32]> = base_map_scan.values().copied().collect();
+
+                let mut scan_stream = stream::iter(0..total_chunks)
+                    .map(|chunk_idx| {
+                        let file = Arc::clone(&file_scan);
+                        async move {
+                            tokio::task::spawn_blocking(move || -> Result<ScanChunk> {
+                                let offset = chunk_idx as u64 * chunk_size as u64;
+                                let bytes_to_read = std::cmp::min(chunk_size as u64, total_bytes - offset) as usize;
+                                let mut buf = vec![0u8; bytes_to_read];
+                                block_io::read_chunk_at(&file, offset, &mut buf)?;
+
+                                if block_io::is_all_zeros(&buf) {
+                                    Ok(ScanChunk::Zero { chunk_idx, bytes: bytes_to_read as u64 })
+                                } else {
+                                    let chunk_hash = hash::compute_chunk_hash(&buf);
+                                    Ok(ScanChunk::Data { chunk_idx, chunk_hash, buf, bytes: bytes_to_read as u64 })
+                                }
+                            })
+                            .await
+                            .context("Scan task panicked")?
+                        }
+                    })
+                    .buffer_unordered(concurrency);
+
+                while let Some(scan_res) = scan_stream.next().await {
+                    let scan_chunk = scan_res?;
+                    reporter_scan.scanned_chunks.fetch_add(1, Ordering::Relaxed);
+
+                    match scan_chunk {
+                        ScanChunk::Zero { bytes, .. } => {
+                            reporter_scan.scanned_bytes.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ScanChunk::Data { chunk_idx, chunk_hash, buf, bytes } => {
+                            reporter_scan.scanned_bytes.fetch_add(bytes, Ordering::Relaxed);
+                            new_manifest.block_map.insert(chunk_idx, chunk_hash);
+
+                            let prior_hash = base_map_scan.get(&chunk_idx);
+                            if prior_hash == Some(&chunk_hash) {
+                                // Content unchanged from baseline; skip upload
+                            } else if known_hashes.insert(chunk_hash) {
+                                // Brand new chunk content not yet uploaded; stream buffer directly into upload pipeline
+                                reporter_scan.queued_chunks.fetch_add(1, Ordering::Relaxed);
+                                upload_tx.send(UploadChunk {
+                                    chunk_idx,
+                                    chunk_hash,
+                                    data: buf,
+                                    bytes,
+                                }).await.map_err(|_| anyhow::anyhow!("Upload consumer dropped prematurely"))?;
                             } else {
-                                let chunk_hash = hash::compute_chunk_hash(&buf);
-                                Ok((chunk_idx, Some(chunk_hash)))
+                                // Chunk changed from baseline for this block, but identical data exists in another block
+                                // Swift CAS already stores this chunk, so upload is deduplicated!
                             }
-                        })
-                        .await
-                        .context("Scan task panicked")?
+                        }
                     }
-                })
-                .buffer_unordered(concurrency);
 
-            while let Some(scan_res) = scan_stream.next().await {
-                let (chunk_idx, maybe_hash) = scan_res?;
-                scanned += 1;
-                let offset = chunk_idx as u64 * chunk_size as u64;
-                let chunk_bytes = std::cmp::min(chunk_size as u64, total_bytes - offset);
-                scanned_bytes += chunk_bytes;
-
-                if let Some(chunk_hash) = maybe_hash {
-                    new_manifest.block_map.insert(chunk_idx, chunk_hash);
-
-                    let prior_hash = base_map.get(&chunk_idx);
-                    if prior_hash != Some(&chunk_hash) {
-                        chunks_to_upload.push((chunk_idx, chunk_hash));
-                    }
+                    reporter_scan.report(false);
                 }
 
-                if last_scan_log.elapsed() >= std::time::Duration::from_secs(5) || scanned == total_chunks as usize {
-                    last_scan_log = std::time::Instant::now();
-                    let elapsed = scan_start.elapsed().as_secs_f64();
-                    let rate_mb = if elapsed > 0.0 {
-                        (scanned_bytes as f64 / 1_048_576.0) / elapsed
-                    } else {
-                        0.0
-                    };
-                    let pct = (scanned as f64 / total_chunks as f64) * 100.0;
-                    info!(
-                        "Scanning volume {}: {}/{} chunks ({:.1}%) [{:.1} MB/s], {} changed chunks found",
-                        volume_id, scanned, total_chunks, pct, rate_mb, chunks_to_upload.len()
-                    );
-                    let _ = std::io::stdout().flush();
-                }
-            }
+                reporter_scan.scan_finished.store(true, Ordering::SeqCst);
+                let scan_elapsed = reporter_scan.start_time.elapsed().as_secs_f64();
+                let scan_bytes = reporter_scan.scanned_bytes.load(Ordering::Relaxed);
+                let scan_mbps = if scan_elapsed > 0.0 { (scan_bytes as f64 / 1_048_576.0) / scan_elapsed } else { 0.0 };
+                let queued = reporter_scan.queued_chunks.load(Ordering::Relaxed);
 
-            chunks_to_upload.sort_unstable_by_key(|&(idx, _)| idx);
-
-            let scan_elapsed = scan_start.elapsed().as_secs_f64();
-            let scan_rate_mb = if scan_elapsed > 0.0 {
-                (total_bytes as f64 / 1_048_576.0) / scan_elapsed
-            } else {
-                0.0
-            };
-            let total_to_upload = chunks_to_upload.len();
-            info!(
-                "Volume scan complete in {:.1}s ({:.1} MB/s): {} active chunks, {} changed chunks to upload to Swift",
-                scan_elapsed,
-                scan_rate_mb,
-                new_manifest.block_map.len(),
-                total_to_upload
-            );
-            let _ = std::io::stdout().flush();
-
-            if total_to_upload == 0 {
-                info!("No changed chunks to upload; snapshot is identical to baseline.");
-                println!("PROGRESS: 100%");
+                info!(
+                    "Volume scan complete in {:.1}s ({:.1} MB/s): {} active chunks, {} changed chunks queued for upload",
+                    scan_elapsed, scan_mbps, new_manifest.block_map.len(), queued
+                );
                 let _ = std::io::stdout().flush();
-            } else {
-                let uploaded_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let uploaded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let upload_start = std::time::Instant::now();
-                let last_upload_log = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-                let dispatched_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let rate_limiter_start = std::time::Instant::now();
 
-                // Parallel upload of changed chunks to Swift (streaming chunk data on-demand to avoid unbounded RAM usage)
-                let upload_stream = stream::iter(chunks_to_upload).map(|(chunk_idx, h)| {
-                    let swift = Arc::clone(&swift);
-                    let container = container.clone();
-                    let file = Arc::clone(&file);
+                drop(upload_tx);
+                Ok::<SnapshotManifest, anyhow::Error>(new_manifest)
+            };
 
-                    let uploaded_chunks = Arc::clone(&uploaded_chunks);
-                    let uploaded_bytes = Arc::clone(&uploaded_bytes);
-                    let last_upload_log = Arc::clone(&last_upload_log);
-                    let dispatched_bytes = Arc::clone(&dispatched_bytes);
-                    let snapshot_id = snapshot_id.clone();
-                    async move {
-                        let hex_name = format!("chunks/{}", hash::hash_to_hex(&h));
-                        let offset = chunk_idx as u64 * chunk_size as u64;
-                        let bytes_to_read = std::cmp::min(chunk_size as u64, total_bytes - offset) as usize;
+            let reporter_upload = reporter.clone();
+            let swift_upload = Arc::clone(&swift);
+            let container_upload = container.clone();
+            let need_head_check = meta.snapshots.len() > 1;
+            let dispatched_bytes = Arc::new(AtomicU64::new(0));
+            let rate_limiter_start = Instant::now();
 
-                        if max_mbps > 0 {
-                            let curr = dispatched_bytes.fetch_add(bytes_to_read as u64, std::sync::atomic::Ordering::SeqCst) + bytes_to_read as u64;
-                            let target_duration = std::time::Duration::from_secs_f64(curr as f64 / (max_mbps as f64 * 1_048_576.0));
-                            let elapsed = rate_limiter_start.elapsed();
-                            if target_duration > elapsed {
-                                tokio::time::sleep(target_duration - elapsed).await;
-                            }
-                        }
-
-                        if !swift.head_object(&container, &hex_name).await.unwrap_or(false) {
-                            let mut data = vec![0u8; bytes_to_read];
-                            block_io::read_chunk_at(&file, offset, &mut data)?;
-                            swift.put_object(&container, &hex_name, data).await?;
-                        }
-
-                        let done = uploaded_chunks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        uploaded_bytes.fetch_add(bytes_to_read as u64, std::sync::atomic::Ordering::SeqCst);
-
-                        let mut last = last_upload_log.lock().unwrap();
-                        if last.elapsed() >= std::time::Duration::from_secs(5) || done == total_to_upload {
-                            *last = std::time::Instant::now();
-                            let elapsed = upload_start.elapsed().as_secs_f64();
-                            let bytes = uploaded_bytes.load(std::sync::atomic::Ordering::SeqCst);
-                            let rate_mb = if elapsed > 0.0 { (bytes as f64 / 1_048_576.0) / elapsed } else { 0.0 };
-                            let pct = (done as f64 / total_to_upload as f64) * 100.0;
-                            let eta_secs = if rate_mb > 0.0 {
-                                let total_bytes_est = total_to_upload as f64 * chunk_size as f64;
-                                let remaining_bytes = total_bytes_est - bytes as f64;
-                                ((remaining_bytes / 1_048_576.0) / rate_mb).max(0.0) as u64
-                            } else {
-                                0
-                            };
-                            info!(
-                                "Uploading snapshot {}: {}/{} chunks ({:.1}%) [{:.1} MB/s, elapsed: {:.0}s, ETA: {}s]",
-                                snapshot_id, done, total_to_upload, pct, rate_mb, elapsed, eta_secs
-                            );
-                            println!("PROGRESS: {:.0}%", pct);
-                            let _ = std::io::stdout().flush();
-                        }
-
-                        Ok::<(), anyhow::Error>(())
-                    }
+            let upload_future = async move {
+                let rx_stream = futures_util::stream::unfold(upload_rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
                 });
 
-                upload_stream
+                rx_stream
+                    .map(|chunk| {
+                        let swift = Arc::clone(&swift_upload);
+                        let container = container_upload.clone();
+                        let reporter = reporter_upload.clone();
+                        let dispatched_bytes = Arc::clone(&dispatched_bytes);
+
+                        async move {
+                            let hex_name = format!("chunks/{}", hash::hash_to_hex(&chunk.chunk_hash));
+
+                            if max_mbps > 0 {
+                                let curr = dispatched_bytes.fetch_add(chunk.bytes, Ordering::SeqCst) + chunk.bytes;
+                                let target_duration = Duration::from_secs_f64(curr as f64 / (max_mbps as f64 * 1_048_576.0));
+                                let elapsed = rate_limiter_start.elapsed();
+                                if target_duration > elapsed {
+                                    tokio::time::sleep(target_duration - elapsed).await;
+                                }
+                            }
+
+                            if need_head_check && swift.head_object(&container, &hex_name).await.unwrap_or(false) {
+                                // Already in Swift from older snapshot
+                            } else {
+                                swift.put_object(&container, &hex_name, chunk.data).await?;
+                            }
+
+                            reporter.uploaded_chunks.fetch_add(1, Ordering::SeqCst);
+                            reporter.uploaded_bytes.fetch_add(chunk.bytes, Ordering::SeqCst);
+                            reporter.report(false);
+
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
                     .buffer_unordered(concurrency)
                     .collect::<Vec<Result<()>>>()
                     .await
                     .into_iter()
                     .collect::<Result<Vec<()>>>()?;
+
+                Ok::<(), anyhow::Error>(())
+            };
+
+            let (new_manifest, ()) = tokio::try_join!(scan_future, upload_future)?;
+            reporter.report(true);
+
+            let total_elapsed = reporter.start_time.elapsed().as_secs_f64();
+            let up_chunks = reporter.uploaded_chunks.load(Ordering::Relaxed);
+            let up_bytes = reporter.uploaded_bytes.load(Ordering::Relaxed);
+            let total_up_mbps = if total_elapsed > 0.0 { (up_bytes as f64 / 1_048_576.0) / total_elapsed } else { 0.0 };
+
+            if up_chunks == 0 {
+                info!("No changed chunks to upload; snapshot is identical to baseline.");
+            } else {
+                info!(
+                    "Pipelined sync complete in {:.1}s: {} chunks uploaded ({:.1} MB/s)",
+                    total_elapsed, up_chunks, total_up_mbps
+                );
             }
+            println!("PROGRESS: 100%");
+            let _ = std::io::stdout().flush();
 
             // Serialize & upload snapshot manifest file
             let manifest_filename = format!("manifest/snapshots/{}.manifest", snapshot_id);
