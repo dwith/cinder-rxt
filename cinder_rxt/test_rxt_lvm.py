@@ -447,6 +447,32 @@ class TestSwiftSnapshots(unittest.TestCase):
 
     @mock.patch("cinder_rxt.snapshots.get_swift_credentials")
     @mock.patch("shutil.which")
+    def test_create_swift_snapshot_with_custom_buffer_mib(
+        self, mock_which, mock_get_creds
+    ):
+        mock_which.return_value = "/usr/local/bin/cinder-rxt-worker"
+        mock_get_creds.return_value = (
+            "http://swift.internal:8080/v1/AUTH_test",
+            "fake-token",
+        )
+        self.configuration.rxt_snapshot_buffer_mib = 1024
+        snapshot = {
+            "id": "snap-uuid-buf",
+            "volume_id": "vol-uuid-buf",
+            "volume_name": "volume-vol-uuid-buf",
+            "volume_size": 20,
+        }
+
+        self.drv.create_snapshot(snapshot)
+
+        self.drv._execute.assert_called_once()
+        args = self.drv._execute.call_args[0]
+        self.assertIn("--max-buffer-mib", args)
+        idx = args.index("--max-buffer-mib")
+        self.assertEqual("1024", args[idx + 1])
+
+    @mock.patch("cinder_rxt.snapshots.get_swift_credentials")
+    @mock.patch("shutil.which")
     def test_restore_swift_snapshot_to_volume(self, mock_which, mock_get_creds):
         mock_which.return_value = "/usr/local/bin/cinder-rxt-worker"
         mock_get_creds.return_value = (

@@ -140,6 +140,23 @@ impl ProgressReporter {
     }
 }
 
+/// Queries the system's available memory in MiB from `/proc/meminfo` on Linux.
+fn get_system_available_ram_mib() -> Option<usize> {
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemAvailable:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<usize>() {
+                        return Some(kb / 1024);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Parser)]
 #[command(name = "cinder-rxt-worker")]
 #[command(about = "High-speed Swift differential snapshot & parallel chunk restore worker")]
@@ -170,6 +187,8 @@ enum Commands {
         concurrency: usize,
         #[arg(long, default_value_t = 0)]
         max_mbps: u64,
+        #[arg(long, default_value_t = 0)]
+        max_buffer_mib: usize,
     },
     /// Reassemble snapshot chunks from Swift and stream directly to local block device
     Restore {
@@ -276,6 +295,7 @@ async fn main() -> Result<()> {
             chunk_size_mib,
             concurrency,
             max_mbps,
+            max_buffer_mib,
         } => {
             let container = format!("{}{}", container_prefix, volume_id);
             let swift = Arc::new(SwiftClient::new(swift_url, swift_token));
@@ -342,7 +362,24 @@ async fn main() -> Result<()> {
             };
 
             let concurrency = concurrency.max(1);
-            let channel_capacity = (concurrency * 2).max(16);
+            let effective_buffer_mib = if max_buffer_mib > 0 {
+                max_buffer_mib
+            } else if let Some(avail_ram) = get_system_available_ram_mib() {
+                // Auto-tune: allocate 1/16th of available RAM, clamped between 256 MiB and 2048 MiB
+                (avail_ram / 16).clamp(256, 2048)
+            } else {
+                (concurrency * 2 * chunk_size_mib).max(256)
+            };
+
+            let min_chunks = (concurrency * 2).max(16);
+            let calculated_chunks = (effective_buffer_mib * 1024 * 1024) / chunk_size;
+            let channel_capacity = calculated_chunks.max(min_chunks);
+
+            info!(
+                "Pipelined queue configured with capacity of {} chunks (~{} MiB buffer in RAM)",
+                channel_capacity,
+                (channel_capacity * chunk_size) / (1024 * 1024)
+            );
             let reporter = ProgressReporter::new(total_chunks, snapshot_id.clone());
 
             let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<UploadChunk>(channel_capacity);

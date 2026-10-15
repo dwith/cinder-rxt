@@ -76,6 +76,11 @@ snapshot_opts = [
         help="Number of concurrent chunk upload/download streams in Rust worker.",
     ),
     cfg.IntOpt(
+        "rxt_snapshot_buffer_mib",
+        default=0,
+        help="Maximum in-memory buffer in MiB for pipelined scan and upload queue in Rust worker (0 = auto-tune based on available RAM).",
+    ),
+    cfg.IntOpt(
         "rxt_snapshot_chunk_size_mib",
         default=4,
         help="Chunk size in MiB for differential hashing and Swift storage.",
@@ -479,6 +484,7 @@ def create_swift_snapshot(
         chunk_size_mib = get_config_value(conf, "rxt_snapshot_chunk_size_mib", 4)
         concurrency = get_config_value(conf, "rxt_snapshot_concurrency", 32)
         max_mbps = get_config_value(conf, "rxt_snapshot_max_mbps", 0)
+        buffer_mib = get_config_value(conf, "rxt_snapshot_buffer_mib", 0)
 
         cmd = [
             worker_bin,
@@ -502,6 +508,8 @@ def create_swift_snapshot(
         ]
         if max_mbps and int(max_mbps) > 0:
             cmd.extend(["--max-mbps", str(max_mbps)])
+        if buffer_mib and int(buffer_mib) > 0:
+            cmd.extend(["--max-buffer-mib", str(buffer_mib)])
 
         with host_snapshot_semaphore(conf):
             out, err = _run_worker_stream(
@@ -956,6 +964,8 @@ def convert_legacy_lvm_snapshot(
 
     if getattr(conf, "rxt_snapshot_max_mbps", 0) > 0:
         cmd.extend(["--max-mbps", str(conf.rxt_snapshot_max_mbps)])
+    if getattr(conf, "rxt_snapshot_buffer_mib", 0) > 0:
+        cmd.extend(["--max-buffer-mib", str(conf.rxt_snapshot_buffer_mib)])
 
     with host_snapshot_semaphore(conf):
         out, err = _run_worker_stream(cmd, conf=conf, execute=execute)
