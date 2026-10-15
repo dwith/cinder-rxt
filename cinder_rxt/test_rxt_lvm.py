@@ -922,6 +922,15 @@ class TestLegacySnapshotConversion(unittest.TestCase):
             with sem.acquire() as s2:
                 self.assertEqual(1, s2)
 
+    def test_host_clone_semaphore_max_slots(self):
+        conf = mock.MagicMock(spec=[])
+        with snapshots.host_clone_semaphore(conf) as s1:
+            self.assertEqual(0, s1)
+            with snapshots.host_clone_semaphore(conf) as s2:
+                self.assertEqual(1, s2)
+                with snapshots.host_clone_semaphore(conf) as s3:
+                    self.assertEqual(2, s3)
+
     @mock.patch("cinder_rxt.snapshots._run_worker_stream", return_value=("", ""))
     @mock.patch("shutil.which", return_value="/usr/local/bin/cinder-rxt-worker")
     def test_copy_volume_accelerated_passes_max_mbps(self, mock_which, mock_worker):

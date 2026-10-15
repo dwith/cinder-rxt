@@ -94,7 +94,7 @@ snapshot_opts = [
     ),
     cfg.IntOpt(
         "rxt_max_concurrent_clones",
-        default=2,
+        default=3,
         help="Maximum number of concurrent volume-to-volume clone operations on this host.",
     ),
     cfg.IntOpt(
@@ -334,7 +334,7 @@ class HostCountingSemaphore:
 
 
 def host_clone_semaphore(configuration):
-    max_slots = get_config_value(configuration, "rxt_max_concurrent_clones", 2)
+    max_slots = get_config_value(configuration, "rxt_max_concurrent_clones", 3)
     lock_dir = get_config_value(configuration, "lock_path", None)
     return HostCountingSemaphore("clone", max_slots, lock_dir=lock_dir).acquire()
 

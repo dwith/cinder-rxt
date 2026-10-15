@@ -210,7 +210,7 @@ enabled_backends = lvmdriver-1
 
 # RXT Decoupled Snapshot & Volume Driver Safeguards and Resource Controls
 rxt_swift_snapshots_enabled = true
-rxt_max_concurrent_clones = 2
+rxt_max_concurrent_clones = 3
 rxt_max_concurrent_snapshots = 4
 rxt_clone_concurrency = 8
 rxt_snapshot_concurrency = 32
@@ -241,7 +241,7 @@ storage_network_multipath: true
 
 # RXT Snapshot & Worker Tuning
 cinder_rxt_swift_snapshots_enabled: true
-cinder_rxt_max_concurrent_clones: 2
+cinder_rxt_max_concurrent_clones: 3
 cinder_rxt_max_concurrent_snapshots: 4
 cinder_rxt_clone_concurrency: 8
 cinder_rxt_snapshot_concurrency: 32
