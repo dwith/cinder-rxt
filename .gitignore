@@ -44,3 +44,4 @@ doc/source/_static/cinder.policy.yaml.sample
 etc/cinder.policy.yaml.sample
 target/
 bin/
+docs/*.pdf
