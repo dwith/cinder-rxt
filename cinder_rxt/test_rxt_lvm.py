@@ -455,7 +455,7 @@ class TestSwiftSnapshots(unittest.TestCase):
             "http://swift.internal:8080/v1/AUTH_test",
             "fake-token",
         )
-        self.configuration.rxt_snapshot_buffer_mib = 1024
+        self.drv.configuration.rxt_snapshot_buffer_mib = 1024
         snapshot = {
             "id": "snap-uuid-buf",
             "volume_id": "vol-uuid-buf",
@@ -701,7 +701,7 @@ class TestLegacySnapshotConversion(unittest.TestCase):
         self.assertEqual("uuid-legacy", conv_info["snapshot_id"])
 
         # Then restored
-        mock_restore.assert_called_once_with(self.drv, volume, snapshot, execute=self.drv._execute)
+        mock_restore.assert_called_once_with(self.drv, volume, snapshot, context=None, execute=self.drv._execute)
 
     def test_delete_snapshot_removes_legacy_local_lv(self):
         # Local snapshot exists on the host
