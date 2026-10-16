@@ -621,7 +621,7 @@ are bypassed completely. An in-memory
 identical blocks in real time. - <strong>Strict Memory Safety &amp;
 Dynamic RAM Auto-Sizing:</strong> The MPSC queue depth is fully
 configurable via <code>--max-buffer-mib</code> (and
-<code>rxt_snapshot_buffer_mib</code> in <code>cinder.conf</code>). If
+<code>rxt_snapshot_buffer_mib</code> in <code>lvm-cinder.conf</code>). If
 unset or set to <code>0</code>, the worker dynamically inspects host
 available RAM via <code>/proc/meminfo</code> and safely allocates up to
 1/16th of available memory, clamped between <strong>256 MiB and 2048

@@ -140,7 +140,7 @@ rxt-bfv-vm-test login:
 
 2. **Phase 2: Staged Cluster Deployment**
    - Deploy `cinder-rxt-worker` binary to `block02`, `block03`, and `block05`.
-   - Update `cinder.conf` via Genestack Ansible without VM downtime.
+   - Update `lvm-cinder.conf` / role vars via Genestack Ansible without VM downtime.
 
 3. **Phase 3: Final Legacy Node Cutover**
    - Transition `block01` to `cinder-rxt`.

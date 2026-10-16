@@ -154,19 +154,34 @@ Rather than executing serial scan and upload phases (which doubled disk reads an
 
 ## Deployment & Configuration (Genestack / OpenStack-Helm)
 
-In production Genestack and Rackspace Flex clouds, `cinder-rxt` is deployed onto dedicated block storage nodes (`cinder-volume`) via the Genestack Ansible playbook `deploy-cinder-volume.yaml` using the `cinder_volumes` role.
+> [!WARNING]
+> **Do NOT modify `/etc/cinder/cinder.conf` directly.**
+> In OpenStack-Helm and Genestack, `/etc/cinder/cinder.conf` is generated automatically by Helm from the Kubernetes secret `cinder-etc`. It is **pristine and shared across all storage backends** (e.g., LVM/RXT, NetApp, Ceph) for cluster-wide primitives such as Keystone authentication, database connections, RabbitMQ messaging, and internal tenant credentials. Any manual changes to `cinder.conf` violate declarative configuration management and will be overwritten whenever Helm or deployment playbooks run.
 
-Following upstream OpenStack-Helm and Cinder conventions, configuration is layered across modular configuration files rather than a single monolithic `cinder.conf`:
+### Modular Configuration Architecture
+
+OpenStack-Helm and Genestack separate configuration files by backend and node function. When starting Cinder services (`cinder-volume`, `cinder-backup`), multiple `--config-file` (`-f`) options are supplied. OpenStack Oslo Config evaluates these files sequentially, allowing backend and host-specific overrides to be layered cleanly on top of the shared base configuration without modifying `cinder.conf`:
+
+```bash
+# General pattern for modular Cinder backends:
+/opt/cinder/bin/cinder-volume \
+  -f /etc/cinder/cinder.conf \
+  -f /etc/cinder/<driver>-cinder.conf \
+  -f /etc/cinder/<driver>-backends.conf \
+  --config-dir /etc/cinder/cinder.conf.d
+```
+
+For dedicated LVM/RXT storage nodes, the file structure and execution sequence is:
 
 ```text
 /etc/cinder/
-├── cinder.conf         # Core OpenStack configuration (Keystone auth, RabbitMQ, DB connection)
-├── backends.conf       # Backend definitions & storage network target portal IPs
-├── lvm-cinder.conf     # Host worker overrides & RXT concurrency / safeguards
-└── cinder.conf.d/      # Service drop-in configuration directory
+├── cinder.conf         # Pristine Helm-generated base (shared across all backends)
+├── backends.conf       # Backend definitions & primary / multipath storage IPs
+├── lvm-cinder.conf     # Host worker overrides & RXT concurrency safeguards
+└── cinder.conf.d/      # Service drop-in snippets (glance.conf, lock_path.conf, etc.)
 ```
 
-The `cinder-volume` systemd service loads all configuration files in sequence:
+The `cinder-volume` systemd service loads this configuration hierarchy in sequence:
 ```bash
 /opt/cinder/bin/cinder-volume \
   --config-file /etc/cinder/cinder.conf \
@@ -175,8 +190,31 @@ The `cinder-volume` systemd service loads all configuration files in sequence:
   --config-dir /etc/cinder/cinder.conf.d
 ```
 
+---
+
+### Automated Deployment via `deploy-cinder-volume.yaml`
+
+The `cinder-rxt` driver is deployed onto dedicated block storage nodes using Genestack's Ansible playbook `deploy-cinder-volume.yaml` and the `cinder_volumes` role:
+
+```bash
+ansible-playbook -i inventories/hosts.yaml \
+  ansible/playbooks/deploy-cinder-volume.yaml \
+  --limit cinder_storage_nodes \
+  -e cinder_worker_name=lvm \
+  -e cinder_backend_name=lvmdriver-1
+```
+
+The `cinder_volumes` role automates the entire node lifecycle:
+1. **Pristine Base Extraction:** Retrieves `cinder-etc`, `cinder-ks-etc`, and `cinder-keystone-admin` secrets from the Kubernetes control plane, writing the pristine `/etc/cinder/cinder.conf` and drop-in files into `/etc/cinder/cinder.conf.d/`.
+2. **Backend Configuration (`/etc/cinder/backends.conf`):** Decodes the backend definition from Kubernetes secrets, sets `volume_driver = cinder_rxt.lvm.RXTLVM`, and dynamically maps the host storage network interfaces (`storage_network_interface` and optional `storage_network_interface_secondary` for multipath iSCSI).
+3. **Worker Overrides (`/etc/cinder/lvm-cinder.conf`):** Renders host identity (`host`), `enabled_backends`, and driver safeguards/concurrency limits under `[DEFAULT]`.
+4. **Rust Worker Build & Installation:** Installs the Rust toolchain (when `cinder_rxt_rust_install: true`), checks out `cinder-rxt` from git, builds the optimized release binary (`cinder-rxt-worker`), and installs it to `/usr/local/bin` and the Cinder virtual environment.
+5. **Systemd Service Management:** Installs and enables `cinder-volume.service`, `cinder-backup.service`, and `cinder-volume-usage-audit.timer` configured with the layered `--config-file` flags.
+
+---
+
 ### 1. Backend Definition: `/etc/cinder/backends.conf`
-Generated automatically by Genestack Ansible from the cluster Kubernetes secret `backends.conf` and the host's dedicated storage network interface (`storage_network_interface`):
+Generated automatically by Genestack Ansible from the cluster Kubernetes secret `backends.conf` and the host's storage network interface:
 
 ```ini
 [lvmdriver-1]
@@ -201,7 +239,7 @@ rxt_swift_snapshots_enabled = true
 > **Backward Compatibility:** Deployments referencing legacy driver namespaces `volume_driver = cinder_rxt.rackspace.RXTLVM` or `target_helper = cinder_rxt.rackspace.RXTTgtAdm` continue to work without modification.
 
 ### 2. Node Worker Overrides: `/etc/cinder/lvm-cinder.conf`
-Generated by Genestack's `configure_backend_lvm.yaml` task to enforce host identity, active backends, and RXT concurrency limits:
+Generated by Genestack's `configure_backend_lvm.yaml` task to enforce host identity, active backends, and RXT concurrency limits without touching `cinder.conf`:
 
 ```ini
 [DEFAULT]
@@ -229,22 +267,33 @@ lock_path = /var/lock/cinder
 lock_path = /var/lock/cinder
 ```
 
-### 3. Genestack Ansible Role Variables
-When deploying via `deploy-cinder-volume.yaml`, adjust role defaults in `group_vars` or `host_vars`:
+### 3. Declarative Configuration via Ansible Role Variables
+Rather than editing configuration files on target hosts, operators customize settings via `group_vars` or `host_vars` passed to `deploy-cinder-volume.yaml`:
 
 ```yaml
-# cinder_volumes role variables (defaults/main.yml)
+# cinder_volumes role variables (defaults/main.yml / group_vars / host_vars)
 cinder_backend_name: "lvmdriver-1"
+cinder_worker_name: "lvm"
 storage_network_interface: "ansible_br_storage"
 storage_network_interface_secondary: "ansible_br_storage_secondary"
 storage_network_multipath: true
 
-# RXT Snapshot & Worker Tuning
+# RXT Driver Git Source & Build
+cinder_rxt_git_repo: "https://github.com/dwith/cinder-rxt.git"
+cinder_rxt_git_version: "lvm-fork-encryption"
+cinder_rxt_rust_install: true
+
+# RXT Decoupled Snapshot & Worker Resource Controls
 cinder_rxt_swift_snapshots_enabled: true
 cinder_rxt_max_concurrent_clones: 3
 cinder_rxt_max_concurrent_snapshots: 4
 cinder_rxt_clone_concurrency: 8
 cinder_rxt_snapshot_concurrency: 32
+cinder_rxt_worker_ionice_class: 0
+cinder_rxt_worker_ionice_level: 4
+cinder_rxt_worker_nice_priority: 0
+cinder_rxt_copy_max_mbps: 0
+cinder_rxt_snapshot_max_mbps: 0
 ```
 
 ---
